@@ -1,0 +1,583 @@
+import streamlit as st
+import pandas as pd
+import xml.etree.ElementTree as ET
+import pdfplumber
+import zipfile
+import io
+import os
+import json
+import time
+import re
+import hashlib
+import google.generativeai as genai
+from pdf2image import convert_from_bytes
+
+st.set_page_config(page_title="Extrator IA v2 (Corrigido)", layout="wide")
+
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
+# Modelo padrão: flash-lite tem cota bem maior que o flash normal
+# no plano gratuito (RPM/RPD superiores). Pode trocar aqui se quiser
+# testar outro (ex: "gemini-2.5-flash").
+MODELO_PADRAO = "gemini-2.5-flash-lite"
+TAMANHO_LOTE_IA = 4          # quantas notas mandamos por chamada de IA
+PAUSA_ENTRE_LOTES = 8        # segundos entre lotes (ajuste conforme RPM da sua conta)
+DPI_IMAGEM = 220             # qualidade da imagem quando o PDF é escaneado
+
+# =========================================================
+# MEMÓRIA E CONTROLE DE CHAVES
+# =========================================================
+if "resultados_salvos" not in st.session_state:
+    st.session_state.resultados_salvos = []
+if "arquivos_processados" not in st.session_state:
+    st.session_state.arquivos_processados = set()
+if "indice_chave_atual" not in st.session_state:
+    st.session_state.indice_chave_atual = 0
+if "hash_para_resultado" not in st.session_state:
+    st.session_state.hash_para_resultado = {}   # hash do arquivo -> linha já processada
+if "chaves_dados_vistos" not in st.session_state:
+    st.session_state.chaves_dados_vistos = {}   # (numero_nota, documento) -> nome do primeiro arquivo
+
+CHAVES_API = []
+for i in range(1, 20):
+    chave = st.secrets.get(f"CHAVE_{i}")
+    if chave:
+        CHAVES_API.append(chave.strip())
+
+CAMPOS = ["Número da Nota", "CNPJ", "CPF", "Valor", "Data", "Fornecedor"]
+
+
+def configurar_ia():
+    if not CHAVES_API or st.session_state.indice_chave_atual >= len(CHAVES_API):
+        return None
+    chave_ativa = CHAVES_API[st.session_state.indice_chave_atual]
+    os.environ["GEMINI_API_KEY"] = chave_ativa
+    genai.configure(api_key=chave_ativa)
+    return genai.GenerativeModel(MODELO_PADRAO)
+
+
+# =========================================================
+# NORMALIZAÇÃO (corrige a inconsistência entre XML e IA)
+# =========================================================
+def normalizar_valor(valor):
+    """Converte 'R$ 2.766,50', '1.500,00', '14000.00' etc. para float consistente."""
+    if valor is None:
+        return None
+    valor = str(valor).strip()
+    if not valor:
+        return None
+    valor = re.sub(r'[Rr]\$\s*', '', valor)
+    valor = valor.replace(' ', '')
+    if ',' in valor:
+        valor = valor.replace('.', '').replace(',', '.')
+    try:
+        return round(float(valor), 2)
+    except ValueError:
+        return None
+
+
+def normalizar_data(data):
+    """Tenta padronizar qualquer formato de data para dd/mm/aaaa."""
+    if not data:
+        return ""
+    data = str(data).strip()[:10]
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', data)
+    if m:
+        return f"{m.group(3)}/{m.group(2)}/{m.group(1)}"
+    m = re.match(r'(\d{2})/(\d{2})/(\d{4})', data)
+    if m:
+        return data
+    return data
+
+
+def normalizar_cnpj(cnpj):
+    """Reformata para XX.XXX.XXX/XXXX-XX se encontrar 14 dígitos, senão devolve como veio."""
+    if not cnpj:
+        return ""
+    digitos = re.sub(r'\D', '', str(cnpj))
+    if len(digitos) == 14:
+        return f"{digitos[0:2]}.{digitos[2:5]}.{digitos[5:8]}/{digitos[8:12]}-{digitos[12:14]}"
+    return str(cnpj).strip()
+
+
+def classificar_documento(valor):
+    """
+    Recebe um valor de documento (de qualquer tag) e devolve (cnpj, cpf)
+    já classificado pela quantidade de dígitos. Protege contra XMLs de
+    prefeitura que reaproveitam a tag <CNPJ> pra guardar um CPF quando
+    o prestador é pessoa física.
+    """
+    if not valor:
+        return "", ""
+    digitos = re.sub(r'\D', '', str(valor))
+    if len(digitos) == 14:
+        return normalizar_cnpj(digitos), ""
+    if len(digitos) == 11:
+        return "", normalizar_cpf(digitos)
+    return str(valor).strip(), ""  # não deu pra classificar, mantém como veio no campo CNPJ
+
+
+def normalizar_cpf(cpf):
+    """Reformata para XXX.XXX.XXX-XX se encontrar 11 dígitos, senão devolve como veio."""
+    if not cpf:
+        return ""
+    digitos = re.sub(r'\D', '', str(cpf))
+    if len(digitos) == 11:
+        return f"{digitos[0:3]}.{digitos[3:6]}.{digitos[6:9]}-{digitos[9:11]}"
+    return str(cpf).strip()
+
+
+# =========================================================
+# EXTRAÇÃO DE XML (corrigida)
+# =========================================================
+def _localname(tag):
+    return tag.split('}')[-1].lower()
+
+
+def buscar_numero_nota(root):
+    """
+    Só aceita o valor se ele for majoritariamente numérico.
+    Isso evita pegar códigos de verificação/protocolo (letras+números)
+    que antes eram confundidos com o número real da nota.
+    Ordem de prioridade: tags mais específicas primeiro.
+    """
+    candidatos_prioritarios = ['numeronfse', 'nnfse', 'nnf', 'numeronota', 'ndps']
+    candidatos_genericos = ['numero']
+
+    def tentar(lista_tags):
+        for tag_alvo in lista_tags:
+            for el in root.iter():
+                if _localname(el.tag) == tag_alvo and el.text:
+                    valor = el.text.strip()
+                    so_digitos = re.sub(r'\D', '', valor)
+                    # aceita só se o texto inteiro for número (ignorando zeros à esquerda)
+                    if so_digitos and so_digitos == re.sub(r'[.\-]', '', valor):
+                        return so_digitos.lstrip('0') or so_digitos
+        return ""
+
+    resultado = tentar(candidatos_prioritarios)
+    if resultado:
+        return resultado
+    return tentar(candidatos_genericos)
+
+
+def achar_container_prestador(root):
+    candidatos = ['prestador', 'prestadorservico', 'emit', 'emitente']
+    for el in root.iter():
+        if _localname(el.tag) in candidatos:
+            return el
+    return root
+
+
+def buscar_tag(parent, tags):
+    if parent is None:
+        return ""
+    alvo = {t.lower() for t in tags}
+    for el in parent.iter():
+        if _localname(el.tag) in alvo and el.text and el.text.strip():
+            return el.text.strip()
+    return ""
+
+
+def extrair_dados_xml(conteudo_bytes):
+    dados = {k: "" for k in CAMPOS}
+    try:
+        xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
+        xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str)
+        root = ET.fromstring(xml_str)
+
+        dados["Número da Nota"] = buscar_numero_nota(root)
+
+        container = achar_container_prestador(root)
+        doc_bruto = buscar_tag(container, ['CNPJ', 'Cnpj', 'cnpjPrestador', 'CPF', 'Cpf', 'cpfPrestador'])
+        fornecedor = buscar_tag(container, ['xFant', 'nomeFantasia', 'xNome', 'RazaoSocial'])
+        if not doc_bruto:
+            doc_bruto = buscar_tag(root, ['CNPJ', 'Cnpj', 'cnpjPrestador', 'CPF', 'Cpf', 'cpfPrestador'])
+        if not fornecedor:
+            fornecedor = buscar_tag(root, ['xFant', 'nomeFantasia', 'xNome', 'RazaoSocial'])
+
+        cnpj, cpf = classificar_documento(doc_bruto)
+        dados["CNPJ"] = cnpj
+        dados["CPF"] = cpf
+        dados["Fornecedor"] = fornecedor
+
+        valor = buscar_tag(root, ['vNF', 'ValorServicos', 'valorLiquido', 'vProd', 'vLiq', 'ValorLiquidoNfse'])
+        dados["Valor"] = normalizar_valor(valor)
+
+        data = buscar_tag(root, ['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi'])
+        dados["Data"] = normalizar_data(data)
+    except Exception:
+        pass
+    return dados
+
+
+# =========================================================
+# EXTRAÇÃO VIA IA — AGORA EM LOTE (menos chamadas = mais cota)
+# =========================================================
+PROMPT_LOTE = """
+Você é um assistente especialista em contabilidade brasileira.
+Abaixo seguem VÁRIOS documentos (notas fiscais), cada um identificado por
+"--- DOCUMENTO N ---". Analise cada um separadamente e retorne ESTRITAMENTE
+um JSON válido no formato de LISTA, um objeto por documento, NA MESMA ORDEM
+em que os documentos foram apresentados:
+
+[
+  {"indice": 1, "Número da Nota": "", "CNPJ": "", "CPF": "", "Valor": "", "Data": "", "Fornecedor": ""},
+  {"indice": 2, "Número da Nota": "", "CNPJ": "", "CPF": "", "Valor": "", "Data": "", "Fornecedor": ""}
+]
+
+Regras:
+- Fornecedor é o Prestador/Emitente do serviço (quem emitiu a nota). Ignore clientes e prefeituras.
+- Se o prestador for PESSOA JURÍDICA, preencha o campo "CNPJ" e deixe "CPF" vazio.
+- Se o prestador for PESSOA FÍSICA (autônomo), preencha o campo "CPF" e deixe "CNPJ" vazio.
+- Nunca preencha os dois campos ao mesmo tempo para o mesmo documento.
+- Valor deve ser só o número, formato "1234.56" (ponto decimal, sem "R$", sem separador de milhar).
+- Data no formato "dd/mm/aaaa".
+- Se não encontrar a informação, deixe a string vazia "".
+- Não invente dados. Não pule nenhum documento da lista.
+"""
+
+
+def extrair_lote_com_ia(itens):
+    """
+    itens: lista de tuplas (identificador, conteudo) onde conteudo é
+    texto (str) ou imagem (PIL.Image).
+    Retorna lista de dicts na mesma ordem de 'itens'.
+    """
+    partes = [PROMPT_LOTE]
+    for i, (identificador, conteudo) in enumerate(itens, start=1):
+        partes.append(f"\n--- DOCUMENTO {i} ({identificador}) ---\n")
+        partes.append(conteudo)
+
+    ultimo_erro = ""
+    while st.session_state.indice_chave_atual < len(CHAVES_API):
+        modelo = configurar_ia()
+        if not modelo:
+            break
+
+        tentativas_mesma_chave = 0
+        while tentativas_mesma_chave < 3:
+            try:
+                resposta = modelo.generate_content(
+                    partes,
+                    generation_config=genai.GenerationConfig(response_mime_type="application/json")
+                )
+                texto = resposta.text.strip()
+                if texto.startswith("```"):
+                    match = re.search(r'\[.*\]', texto, re.DOTALL)
+                    if match:
+                        texto = match.group(0)
+                lista = json.loads(texto)
+                # garante que devolvemos um item por entrada do lote, na ordem certa
+                resultado_ordenado = [None] * len(itens)
+                for obj in lista:
+                    idx = obj.get("indice")
+                    if isinstance(idx, int) and 1 <= idx <= len(itens):
+                        resultado_ordenado[idx - 1] = obj
+                for j in range(len(itens)):
+                    if resultado_ordenado[j] is None:
+                        resultado_ordenado[j] = {k: "" for k in CAMPOS}
+                return resultado_ordenado
+
+            except Exception as e:
+                erro = str(e).lower()
+                chave_num = st.session_state.indice_chave_atual + 1
+
+                if "429" in erro or "quota" in erro or "exhausted" in erro:
+                    tentativas_mesma_chave += 1
+                    ultimo_erro = "Cota esgotada."
+                    if tentativas_mesma_chave < 3:
+                        st.toast("⏳ Limite momentâneo atingido. Pausando 30s...")
+                        time.sleep(30)
+                        continue
+                    else:
+                        st.toast(f"⚠️ Chave {chave_num} esgotou. Trocando...")
+                        break
+                elif "401" in erro or "authentication" in erro:
+                    st.toast(f"❌ Chave {chave_num} inválida. Pulando...")
+                    ultimo_erro = "Chave inválida."
+                    break
+                else:
+                    erro_dict = {k: "Erro" for k in CAMPOS}
+                    erro_dict["Fornecedor"] = f"Erro interno: {str(e)[:60]}"
+                    return [erro_dict for _ in itens]
+
+        st.session_state.indice_chave_atual += 1
+        time.sleep(2)
+
+    erro_dict = {k: "Erro" for k in CAMPOS}
+    erro_dict["Fornecedor"] = f"FIM DAS CHAVES. {ultimo_erro}"
+    return [erro_dict for _ in itens]
+
+
+# =========================================================
+# PREPARAÇÃO DE CADA ARQUIVO (extrai texto/imagem ou processa XML direto)
+# =========================================================
+def preparar_arquivo(item):
+    """
+    Retorna:
+    - ("xml_pronto", dados_dict, nome_arquivo)  -> já resolvido, sem precisar de IA
+    - ("ia_pendente", conteudo_para_ia, nome_arquivo) -> precisa entrar no lote de IA
+    - ("invalido", None, nome_arquivo)
+    """
+    nome_arquivo, conteudo = item
+
+    if nome_arquivo.lower().endswith('.xml'):
+        dados = extrair_dados_xml(conteudo)
+        return ("xml_pronto", dados, nome_arquivo)
+
+    if nome_arquivo.lower().endswith('.pdf'):
+        texto_pdf = ""
+        try:
+            with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
+                for pagina in pdf.pages[:2]:  # olha até 2 páginas, não só a primeira
+                    t = pagina.extract_text()
+                    if t:
+                        texto_pdf += t + "\n"
+        except Exception:
+            pass
+
+        if len(texto_pdf.strip()) > 50:
+            return ("ia_pendente", texto_pdf, nome_arquivo)
+        else:
+            try:
+                imagens = convert_from_bytes(conteudo, dpi=DPI_IMAGEM, first_page=1, last_page=1)
+                if imagens:
+                    return ("ia_pendente", imagens[0], nome_arquivo)
+            except Exception:
+                pass
+
+    return ("invalido", None, nome_arquivo)
+
+
+def extrair_numero_do_nome_arquivo(nome_arquivo):
+    """
+    Fallback: quando o XML/IA não acham o número da nota, tenta pescar
+    do próprio nome do arquivo. Só aceita padrões com um rótulo claro
+    (NF, NFE, NFSE, ND, NOTA, NOTA FISCAL, Nº, N°, NUM) na frente do
+    número, pra não confundir com sufixos de download tipo "(1)", "(2)"
+    ou outros números soltos (ex: CNPJ, valor) que às vezes aparecem no nome.
+    """
+    nome = os.path.splitext(os.path.basename(nome_arquivo))[0]
+    # remove separador de milhar entre dígitos (ex: "1.234" -> "1234"),
+    # pra não cortar o número no primeiro ponto
+    nome_limpo = re.sub(r'(?<=\d)[.,](?=\d{3}(?!\d))', '', nome)
+
+    rotulos = r'(?:NOTA\s*FISCAL|NFS\s*-?\s*E|NFE|NF|N[ºo°]|NUM(?:ERO)?|ND|NOTA)'
+    padrao = rf'(?<![A-Za-z]){rotulos}[\s_\-\.:]*?(\d{{1,15}})(?!\d)'
+    m = re.search(padrao, nome_limpo, re.IGNORECASE)
+    if m:
+        numero = m.group(1)
+        return numero.lstrip('0') or numero
+    return ""
+
+
+def marcar_duplicidade_por_dados(linha):
+    """
+    Compara Número da Nota + documento (CNPJ ou CPF) com o que já foi visto
+    na sessão. Só compara quando os dois estão preenchidos, pra não gerar
+    falso positivo em notas onde a extração falhou (várias linhas vazias
+    não devem ser marcadas como 'iguais' entre si).
+    """
+    numero = str(linha.get("Número da Nota") or "").strip()
+    doc = str(linha.get("CNPJ") or linha.get("CPF") or "").strip()
+    if not numero or not doc:
+        return linha
+
+    chave = (numero, re.sub(r'\D', '', doc))
+    visto = st.session_state.chaves_dados_vistos.get(chave)
+    if visto and visto != linha.get("Arquivo"):
+        linha["Duplicada"] = f"Mesma nota/doc de: {visto}"
+    else:
+        st.session_state.chaves_dados_vistos.setdefault(chave, linha.get("Arquivo", ""))
+    return linha
+
+
+def finalizar_linha(dados, nome_arquivo):
+    dados = dict(dados)
+    dados["Valor"] = normalizar_valor(dados.get("Valor"))
+    dados["Data"] = normalizar_data(dados.get("Data"))
+    dados["CNPJ"] = normalizar_cnpj(dados.get("CNPJ"))
+    dados["CPF"] = normalizar_cpf(dados.get("CPF"))
+    dados["Arquivo"] = os.path.basename(nome_arquivo)
+
+    motivos = []
+
+    if not dados.get("Número da Nota"):
+        numero_do_nome = extrair_numero_do_nome_arquivo(nome_arquivo)
+        if numero_do_nome:
+            dados["Número da Nota"] = numero_do_nome
+            motivos.append("Nº obtido do nome do arquivo (conferir)")
+        else:
+            motivos.append("Falta Número da Nota")
+
+    if not dados.get("CNPJ") and not dados.get("CPF"):
+        motivos.append("Falta CNPJ/CPF")
+    if not dados.get("Valor"):
+        motivos.append("Falta Valor")
+
+    dados["Revisar"] = "; ".join(motivos)
+    dados["Duplicada"] = ""
+    chaves = CAMPOS + ["Arquivo", "Revisar", "Duplicada"]
+    linha = {k: dados.get(k, "") for k in chaves}
+    return marcar_duplicidade_por_dados(linha)
+
+
+# =========================================================
+# INTERFACE
+# =========================================================
+st.title("🤖 Extrator Multi-Chaves v2 (com lote + validação)")
+
+if not CHAVES_API:
+    st.error("⚠️ Nenhuma chave CHAVE_1, CHAVE_2... encontrada nos Secrets.")
+else:
+    chaves_restantes = len(CHAVES_API) - st.session_state.indice_chave_atual
+    st.sidebar.success(f"🔑 Chaves na fila: {chaves_restantes} de {len(CHAVES_API)}")
+    st.sidebar.info(f"🗝️ Usando agora a chave número: {st.session_state.indice_chave_atual + 1}")
+    st.sidebar.caption(
+        "⚠️ Lembrete: se todas as chaves forem do mesmo projeto do Google Cloud, "
+        "elas compartilham a MESMA cota. Confira em aistudio.google.com."
+    )
+    st.sidebar.markdown(f"**Modelo:** `{MODELO_PADRAO}`")
+    st.sidebar.markdown(f"**Notas por chamada de IA:** {TAMANHO_LOTE_IA}")
+
+if st.sidebar.button("🗑️ Limpar memória e resetar chaves"):
+    st.session_state.resultados_salvos = []
+    st.session_state.arquivos_processados = set()
+    st.session_state.indice_chave_atual = 0
+    st.session_state.hash_para_resultado = {}
+    st.session_state.chaves_dados_vistos = {}
+    st.rerun()
+
+arquivos_carregados = st.file_uploader("ZIP ou arquivos soltos", type=["xml", "pdf", "zip"], accept_multiple_files=True)
+
+if arquivos_carregados and CHAVES_API:
+    lista_arquivos = []
+    with st.spinner("Preparando arquivos..."):
+        for arq in arquivos_carregados:
+            if arq.name.lower().endswith('.zip'):
+                try:
+                    with zipfile.ZipFile(io.BytesIO(arq.read())) as z:
+                        for nome in z.namelist():
+                            if nome.lower().endswith(('.xml', '.pdf')) and not nome.startswith('__'):
+                                lista_arquivos.append((nome, z.read(nome)))
+                except Exception:
+                    pass
+            else:
+                lista_arquivos.append((arq.name, arq.read()))
+
+    arquivos_pendentes = [a for a in lista_arquivos if a[0] not in st.session_state.arquivos_processados]
+
+    if arquivos_pendentes:
+        st.info(f"Faltam {len(arquivos_pendentes)} notas.")
+        barra = st.progress(0)
+        tabela_placeholder = st.empty()
+
+        # Separa: XMLs resolvem na hora, PDFs vão para fila de lote de IA
+        fila_ia = []  # lista de (nome_arquivo, conteudo_para_ia, hash_arquivo)
+        total = len(arquivos_pendentes)
+        processados = 0
+
+        for nome_arquivo, conteudo in arquivos_pendentes:
+            hash_arquivo = hashlib.md5(conteudo).hexdigest()
+            resultado_reaproveitado = st.session_state.hash_para_resultado.get(hash_arquivo)
+
+            if resultado_reaproveitado:
+                # Mesmo conteúdo já processado antes nesta sessão: reaproveita
+                # o resultado sem gastar uma nova chamada de IA nem reler o XML.
+                linha = dict(resultado_reaproveitado)
+                linha["Arquivo"] = os.path.basename(nome_arquivo)
+                linha["Duplicada"] = f"Arquivo idêntico a: {resultado_reaproveitado.get('Arquivo', '')}"
+                st.session_state.resultados_salvos.append(linha)
+                st.session_state.arquivos_processados.add(nome_arquivo)
+                processados += 1
+
+                df_parcial = pd.DataFrame(st.session_state.resultados_salvos)
+                if not df_parcial.empty:
+                    colunas_exibicao = CAMPOS + ["Arquivo", "Revisar", "Duplicada"]
+                    df_parcial = df_parcial.reindex(columns=colunas_exibicao, fill_value="")
+                    tabela_placeholder.dataframe(df_parcial, use_container_width=True)
+                barra.progress(min(processados / total, 1.0))
+                continue
+
+            tipo, dado_ou_conteudo, _ = preparar_arquivo((nome_arquivo, conteudo))
+
+            if tipo == "xml_pronto":
+                linha = finalizar_linha(dado_ou_conteudo, nome_arquivo)
+                st.session_state.hash_para_resultado[hash_arquivo] = dict(linha)
+                st.session_state.resultados_salvos.append(linha)
+                st.session_state.arquivos_processados.add(nome_arquivo)
+                processados += 1
+            elif tipo == "ia_pendente":
+                fila_ia.append((nome_arquivo, dado_ou_conteudo, hash_arquivo))
+            else:
+                linha = finalizar_linha({k: "" for k in CAMPOS}, nome_arquivo)
+                linha["Fornecedor"] = "Inválido/Corrompido"
+                st.session_state.hash_para_resultado[hash_arquivo] = dict(linha)
+                st.session_state.resultados_salvos.append(linha)
+                st.session_state.arquivos_processados.add(nome_arquivo)
+                processados += 1
+
+            # Quando a fila de IA atinge o tamanho do lote, processa
+            if len(fila_ia) >= TAMANHO_LOTE_IA:
+                if st.session_state.indice_chave_atual >= len(CHAVES_API):
+                    st.error("🛑 TODAS AS CHAVES FALHARAM OU ESGOTARAM.")
+                    break
+                itens_lote = [(nf, c) for nf, c, _ in fila_ia]
+                resultados_lote = extrair_lote_com_ia(itens_lote)
+                for (nf, _, h), dados in zip(fila_ia, resultados_lote):
+                    linha = finalizar_linha(dados, nf)
+                    st.session_state.hash_para_resultado[h] = dict(linha)
+                    st.session_state.resultados_salvos.append(linha)
+                    st.session_state.arquivos_processados.add(nf)
+                    processados += 1
+                fila_ia = []
+                time.sleep(PAUSA_ENTRE_LOTES)
+
+            df_parcial = pd.DataFrame(st.session_state.resultados_salvos)
+            if not df_parcial.empty:
+                colunas_exibicao = CAMPOS + ["Arquivo", "Revisar", "Duplicada"]
+                df_parcial = df_parcial.reindex(columns=colunas_exibicao, fill_value="")
+                tabela_placeholder.dataframe(df_parcial, use_container_width=True)
+            barra.progress(min(processados / total, 1.0))
+
+        # processa o que sobrou na fila (lote incompleto no final)
+        if fila_ia and st.session_state.indice_chave_atual < len(CHAVES_API):
+            itens_lote = [(nf, c) for nf, c, _ in fila_ia]
+            resultados_lote = extrair_lote_com_ia(itens_lote)
+            for (nf, _, h), dados in zip(fila_ia, resultados_lote):
+                linha = finalizar_linha(dados, nf)
+                st.session_state.hash_para_resultado[h] = dict(linha)
+                st.session_state.resultados_salvos.append(linha)
+                st.session_state.arquivos_processados.add(nf)
+
+            df_parcial = pd.DataFrame(st.session_state.resultados_salvos)
+            colunas_exibicao = CAMPOS + ["Arquivo", "Revisar", "Duplicada"]
+            df_parcial = df_parcial.reindex(columns=colunas_exibicao, fill_value="")
+            tabela_placeholder.dataframe(df_parcial, use_container_width=True)
+
+    if st.session_state.resultados_salvos:
+        colunas_finais = CAMPOS + ["Arquivo", "Revisar", "Duplicada"]
+        # reindex em vez de indexação direta: se alguma linha antiga (de uma
+        # sessão anterior, antes de alguma atualização do código) não tiver
+        # todas as colunas, isso preenche com "" em vez de quebrar o app.
+        df_final = pd.DataFrame(st.session_state.resultados_salvos).reindex(columns=colunas_finais, fill_value="")
+
+        n_revisar = (df_final["Revisar"] != "").sum()
+        if n_revisar:
+            st.warning(f"⚠️ {n_revisar} nota(s) com algo pra conferir — veja a coluna 'Revisar'.")
+
+        n_duplicadas = (df_final["Duplicada"] != "").sum()
+        if n_duplicadas:
+            st.warning(f"🔁 {n_duplicadas} nota(s) possivelmente duplicada(s) — veja a coluna 'Duplicada'.")
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_final.to_excel(writer, index=False)
+        st.download_button(
+            "📥 Baixar Tabela",
+            output.getvalue(),
+            "Notas_Finais.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
